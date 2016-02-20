@@ -1344,7 +1344,7 @@ main(int argc, char *argv[])
 	}
 	/* Enable the Stream Reconfiguration extension. */
 	av.assoc_id = SCTP_ALL_ASSOC;
-	av.assoc_value = SCTP_ENABLE_RESET_STREAM_REQ | SCTP_ENABLE_CHANGE_ASSOC_REQ;
+	av.assoc_value = SCTP_ENABLE_RESET_STREAM_REQ;
 	if (setsockopt(fd, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET, &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
 		perror("setsockopt SCTP_ENABLE_STREAM_RESET");
 	}

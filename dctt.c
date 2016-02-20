@@ -30,11 +30,6 @@
  *
  */
 
-/*
- * For compilation on FreeBSD use
- * cc -g -Wall -std=c99 -pedantic -o dctt -pthread dctt.c 
- */
-
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -1311,12 +1306,49 @@ main(int argc, char *argv[])
 	if (setsockopt(fd, IPPROTO_SCTP, SCTP_EXPLICIT_EOR, &on, sizeof(int)) < 0) {
 		perror("setsockopt SCTP_EXPLICIT_EOR");
 	}
-	/* Allow resetting streams. */
+	/* Disable the Explicit Congestion Notification extension */
+	av.assoc_id = 0;
+	av.assoc_value = 0;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_ECN_SUPPORTED, (char*) &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt(SCTP_ECN_SUPPORTED)");
+	}
+	/* Disable the Address Reconfiguration extension */
+	av.assoc_id = 0;
+	av.assoc_value = 0;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_ASCONF_SUPPORTED, (char*) &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt(SCTP_ASCONF_SUPPORTED)");
+	}
+	/* Disable the Authentication extension */
+	av.assoc_id = 0;
+	av.assoc_value = 0;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_AUTH_SUPPORTED, (char*) &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt(SCTP_AUTH_SUPPORTED)");
+	}
+	/* Disable the NR-SACK extension */
+	av.assoc_id = 0;
+	av.assoc_value = 0;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_NRSACK_SUPPORTED, (char*) &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt(SCTP_NRSACK_SUPPORTED)");
+	}
+	/* Disable the Packet Drop Report extension */
+	av.assoc_id = 0;
+	av.assoc_value = 0;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_PKTDROP_SUPPORTED, (char*) &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt(SCTP_PKTDROP_SUPPORTED)");
+	}
+	/* Enable the Partial Reliability extension */
+	av.assoc_id = SCTP_ALL_ASSOC;
+	av.assoc_value = 1;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_PR_SUPPORTED, &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
+		perror("setsockopt SCTP_PR_SUPPORTED");
+	}
+	/* Enable the Stream Reconfiguration extension. */
 	av.assoc_id = SCTP_ALL_ASSOC;
 	av.assoc_value = SCTP_ENABLE_RESET_STREAM_REQ | SCTP_ENABLE_CHANGE_ASSOC_REQ;
-	if (setsockopt(fd, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET, &av, sizeof(struct sctp_assoc_value)) < 0) {
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET, &av, (socklen_t)sizeof(struct sctp_assoc_value)) < 0) {
 		perror("setsockopt SCTP_ENABLE_STREAM_RESET");
 	}
+
 	/* Enable the events of interest. */
 	memset(&event, 0, sizeof(event));
 	event.se_assoc_id = SCTP_ALL_ASSOC;
@@ -1328,7 +1360,7 @@ main(int argc, char *argv[])
 		}
 	}
 	memset(&initmsg, 0, sizeof(struct sctp_initmsg));
-	initmsg.sinit_num_ostreams = 5;
+	initmsg.sinit_num_ostreams = 65535;
 	initmsg.sinit_max_instreams = 65535;
 	if (setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, sizeof(struct sctp_initmsg)) < 0) {
 		perror("setsockopt SCTP_INITMSG");

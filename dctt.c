@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <netinet/sctp.h>
 #include <arpa/inet.h>
+#include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,90 +60,77 @@
 #define DATA_CHANNEL_CLOSED     4
 
 #define DATA_CHANNEL_FLAGS_SEND_REQ 0x00000001
-#define DATA_CHANNEL_FLAGS_SEND_RSP 0x00000002
-#define DATA_CHANNEL_FLAGS_SEND_ACK 0x00000004
+#define DATA_CHANNEL_FLAGS_SEND_ACK 0x00000002
+#define DATA_CHANNEL_FLAGS_I_RESET  0x00000004
+#define DATA_CHANNEL_FLAGS_O_RESET  0x00000008
 
 struct channel {
-	uint32_t id;
-	uint32_t pr_value;
+	uint16_t sid;
 	uint16_t pr_policy;
-	uint16_t i_stream;
-	uint16_t o_stream;
+	uint32_t pr_value;
 	uint8_t unordered;
+	uint8_t type;
+	uint16_t priority;
+	char *label;
+	char *protocol;
 	uint8_t state;
 	uint32_t flags;
 };
 
 struct peer_connection {
 	struct channel channels[NUMBER_OF_CHANNELS];
-	struct channel *i_stream_channel[NUMBER_OF_STREAMS];
-	struct channel *o_stream_channel[NUMBER_OF_STREAMS];
-	uint16_t o_stream_buffer[NUMBER_OF_STREAMS];
-	uint32_t o_stream_buffer_counter;
 	pthread_mutex_t mutex;
 	int fd;
+	int client;
 } peer_connection;
 
-#define DATA_CHANNEL_OPEN_REQUEST  0
-#define DATA_CHANNEL_OPEN_RESPONSE 1
-#define DATA_CHANNEL_ACK           2
 
-#define DATA_CHANNEL_RELIABLE                0
-#define DATA_CHANNEL_RELIABLE_STREAM         1
-#define DATA_CHANNEL_UNRELIABLE              2
-#define DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT 3
-#define DATA_CHANNEL_PARTIAL_RELIABLE_TIMED  4
+#define DATA_CHANNEL_ACK_MESSAGE_TYPE           2
+#define DATA_CHANNEL_OPEN_MESSAGE_TYPE          3
 
-#define DATA_CHANNEL_FLAG_OUT_OF_ORDER_ALLOWED 0x0001
+#define DATA_CHANNEL_RELIABLE                          0x00
+#define DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT           0x01
+#define DATA_CHANNEL_PARTIAL_RELIABLE_TIMED            0x02
+#define DATA_CHANNEL_RELIABLE_UNORDERED                0x80
+#define DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED 0x81
+#define DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED  0x82
+#define DATA_CHANNEL_UNORDERED                         0x80
 
-#define SCTP_PACKED __attribute__((packed))
-
-struct rtcweb_datachannel_open_request {
-	uint8_t msg_type; /* DATA_CHANNEL_OPEN_REQUEST */
+struct rtcweb_datachannel_open {
+	uint8_t message_type; /* DATA_CHANNEL_OPEN */
 	uint8_t channel_type;
-	uint16_t flags;
-	uint16_t reliability_params;
-	int16_t priority;
-	char label[];
-} SCTP_PACKED;
-
-struct rtcweb_datachannel_open_response {
-	uint8_t msg_type; /* DATA_CHANNEL_OPEN_RESPONSE */
-	uint8_t error;
-	uint16_t flags;
-	uint16_t reverse_stream;
-} SCTP_PACKED;
+	uint16_t priority;
+	uint32_t reliability_parameter;
+	uint16_t label_length;
+	uint16_t protocol_length;
+	char label_and_protocol[];
+} __attribute__((packed));
 
 struct rtcweb_datachannel_ack {
-	uint8_t msg_type; /* DATA_CHANNEL_ACK */
-} SCTP_PACKED;
-
-#undef SCTP_PACKED
+	uint8_t message_type; /* DATA_CHANNEL_ACK */
+} __attribute__((packed));
 
 static void
-init_peer_connection(struct peer_connection *pc, int fd)
+init_peer_connection(struct peer_connection *pc, int fd, int client)
 {
 	uint32_t i;
 	struct channel *channel;
 
 	for (i = 0; i < NUMBER_OF_CHANNELS; i++) {
 		channel = &(pc->channels[i]);
-		channel->id = i;
-		channel->state = DATA_CHANNEL_CLOSED;
+		channel->sid = i;
 		channel->pr_policy = SCTP_PR_SCTP_NONE;
 		channel->pr_value = 0;
-		channel->i_stream = 0;
-		channel->o_stream = 0;
 		channel->unordered = 0;
+		channel->type = 0xff;
+		channel->priority = 0;
+		channel->label = NULL;
+		channel->protocol = NULL;
+		channel->state = DATA_CHANNEL_CLOSED;
 		channel->flags = 0;
 	}
-	for (i = 0; i < NUMBER_OF_STREAMS; i++) {
-		pc->i_stream_channel[i] = NULL;
-		pc->o_stream_channel[i] = NULL;
-		pc->o_stream_buffer[i] = 0;
-	}
-	pc->o_stream_buffer_counter = 0;
 	pc->fd = fd;
+	pc->client = client;
 	pthread_mutex_init(&pc->mutex, NULL);
 }
 
@@ -159,20 +147,10 @@ unlock_peer_connection(struct peer_connection *pc)
 }
 
 static struct channel *
-find_channel_by_i_stream(struct peer_connection *pc, uint16_t i_stream)
+find_channel_by_id(struct peer_connection *pc, uint16_t id)
 {
-	if (i_stream < NUMBER_OF_STREAMS) {
-		return (pc->i_stream_channel[i_stream]);
-	} else {
-		return (NULL);
-	}
-}
-
-static struct channel *
-find_channel_by_o_stream(struct peer_connection *pc, uint16_t o_stream)
-{
-	if (o_stream < NUMBER_OF_STREAMS) {
-		return (pc->o_stream_channel[o_stream]);
+	if (id < NUMBER_OF_STREAMS) {
+		return (&(pc->channels[id]));
 	} else {
 		return (NULL);
 	}
@@ -183,122 +161,53 @@ find_free_channel(struct peer_connection *pc)
 {
 	uint32_t i;
 
-	for (i = 0; i < NUMBER_OF_CHANNELS; i++) {
+	for (i = pc->client ? 0 : 1; i < NUMBER_OF_CHANNELS; i += 2) {
 		if (pc->channels[i].state == DATA_CHANNEL_CLOSED) {
 			break;
 		}
 	}
-	if (i == NUMBER_OF_CHANNELS) {
+	if (i >= NUMBER_OF_CHANNELS) {
 		return (NULL);
 	} else {
 		return (&(pc->channels[i]));
 	}
 }
 
-static uint16_t
-find_free_o_stream(struct peer_connection *pc)
-{
-	struct sctp_status status;
-	uint32_t i, limit;
-	socklen_t len;
-
-	len = (socklen_t)sizeof(struct sctp_status);
-	if (getsockopt(pc->fd, IPPROTO_SCTP, SCTP_STATUS, &status, &len) < 0) {
-		perror("getsockopt");
-		return (0);
-	}
-	if (status.sstat_outstrms < NUMBER_OF_STREAMS) {
-		limit = status.sstat_outstrms;
-	} else {
-		limit = NUMBER_OF_STREAMS;
-	}
-	/* stream id 0 is reserved */
-	for (i = 1; i < limit; i++) {
-		if (pc->o_stream_channel[i] == NULL) {
-			break;
-		}
-	}
-	if (i == limit) {
-		return (0);
-	} else {
-		return ((uint16_t)i);
-	}
-}
-
-static void
-request_more_o_streams(struct peer_connection *pc)
-{
-	struct sctp_status status;
-	struct sctp_add_streams sas;
-	uint32_t i, o_streams_needed;
-	socklen_t len;
-
-	o_streams_needed = 0;
-	for (i = 0; i < NUMBER_OF_CHANNELS; i++) {
-		if ((pc->channels[i].state == DATA_CHANNEL_CONNECTING) &&
-		    (pc->channels[i].o_stream == 0)) {
-			o_streams_needed++;
-		}
-	}
-	len = (socklen_t)sizeof(struct sctp_status);
-	if (getsockopt(pc->fd, IPPROTO_SCTP, SCTP_STATUS, &status, &len) < 0) {
-		perror("getsockopt");
-		return;
-	}
-	if (status.sstat_outstrms + o_streams_needed > NUMBER_OF_STREAMS) {
-		o_streams_needed = NUMBER_OF_STREAMS - status.sstat_outstrms;
-	}
-	if (o_streams_needed == 0) {
-		return;
-	}
-	memset(&sas, 0, sizeof(struct sctp_add_streams));
-	sas.sas_instrms = 0;
-	sas.sas_outstrms = (uint16_t)o_streams_needed; /* XXX eror handling */
-	if (setsockopt(pc->fd, IPPROTO_SCTP, SCTP_ADD_STREAMS, &sas, (socklen_t)sizeof(struct sctp_add_streams)) < 0) {
-		perror("setsockopt");
-	}
-	return;
-}
-
 static int
-send_open_request_message(int fd, uint16_t o_stream, uint8_t unordered, uint16_t pr_policy, uint32_t pr_value)
+send_data_channel_open_message(int fd,
+                               uint16_t sid,
+                               uint8_t channel_type,
+                               uint16_t priority,
+                               uint32_t reliability_parameter,
+                               char *label,
+                               char *protocol)
 {
-	/* XXX: This should be encoded in a better way */
-	struct rtcweb_datachannel_open_request req;
+	struct rtcweb_datachannel_open dc_open;
 	struct sctp_sndinfo sndinfo;
-	struct iovec iov;
+	struct iovec iov[3];
 
-	memset(&req, 0, sizeof(struct rtcweb_datachannel_open_request));
-	req.msg_type = DATA_CHANNEL_OPEN_REQUEST;
-	switch (pr_policy) {
-	case SCTP_PR_SCTP_NONE:
-		/* XXX: What about DATA_CHANNEL_RELIABLE_STREAM */
-		req.channel_type = DATA_CHANNEL_RELIABLE;
-		break;
-	case SCTP_PR_SCTP_TTL:
-		/* XXX: What about DATA_CHANNEL_UNRELIABLE */
-		req.channel_type = DATA_CHANNEL_PARTIAL_RELIABLE_TIMED;
-		break;
-	case SCTP_PR_SCTP_RTX:
-		req.channel_type = DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT;
-		break;
-	default:
-		return (0);
-	}
-	req.flags = htons(0);
-	if (unordered) {
-		req.flags |= htons(DATA_CHANNEL_FLAG_OUT_OF_ORDER_ALLOWED);
-	}
-	req.reliability_params = htons((uint16_t)pr_value); /* XXX Why 16-bit */
-	req.priority = htons(0); /* XXX: add support */
-	iov.iov_base = &req;
-	iov.iov_len = sizeof(struct rtcweb_datachannel_open_request);
+	assert(label != NULL);
+	assert(strlen(label) < 65536);
+	assert(protocol != NULL);
+	assert(strlen(protocol) < 65536);
+	dc_open.message_type = DATA_CHANNEL_OPEN_MESSAGE_TYPE;
+	dc_open.channel_type = channel_type;
+	dc_open.priority = htons(priority);
+	dc_open.reliability_parameter = htonl(reliability_parameter);
+	dc_open.label_length = htons((uint16_t)strlen(label));
+	dc_open.protocol_length = htons((uint16_t)strlen(protocol));
+	iov[0].iov_base = &dc_open;
+	iov[0].iov_len = sizeof(struct rtcweb_datachannel_open);
+	iov[1].iov_base = label;
+	iov[1].iov_len = strlen(label);
+	iov[2].iov_base = protocol;
+	iov[2].iov_len = strlen(protocol);
 	memset(&sndinfo, 0, sizeof(struct sctp_sndinfo));
-	sndinfo.snd_sid = o_stream;
+	sndinfo.snd_sid = sid;
 	sndinfo.snd_flags = SCTP_EOR;
 	sndinfo.snd_ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
 	if (sctp_sendv(fd,
-	               &iov, 1,
+	               iov, 3,
 	               NULL, 0,
 	               &sndinfo, (socklen_t)sizeof(struct sctp_sndinfo),
 	               SCTP_SENDV_SNDINFO, 0) < 0) {
@@ -310,54 +219,22 @@ send_open_request_message(int fd, uint16_t o_stream, uint8_t unordered, uint16_t
 }
 
 static int
-send_open_response_message(int fd, uint16_t o_stream, uint16_t i_stream)
+send_data_channel_ack_message(int fd,
+                              uint16_t sid)
 {
-	/* XXX: This should be encoded in a better way */
-	struct rtcweb_datachannel_open_response rsp;
+	struct rtcweb_datachannel_ack dc_ack;
 	struct sctp_sndinfo sndinfo;
-	struct iovec iov;
+	struct iovec iov[1];
 
-	memset(&rsp, 0, sizeof(struct rtcweb_datachannel_open_response));
-	rsp.msg_type = DATA_CHANNEL_OPEN_RESPONSE;
-	rsp.error = 0;
-	rsp.flags = htons(0);
-	rsp.reverse_stream = htons(i_stream);
-	iov.iov_base = &rsp;
-	iov.iov_len = sizeof(struct rtcweb_datachannel_open_response);
+	dc_ack.message_type = DATA_CHANNEL_ACK_MESSAGE_TYPE;
+	iov[0].iov_base = &dc_ack;
+	iov[0].iov_len = sizeof(struct rtcweb_datachannel_ack);
 	memset(&sndinfo, 0, sizeof(struct sctp_sndinfo));
-	sndinfo.snd_sid = o_stream;
+	sndinfo.snd_sid = sid;
 	sndinfo.snd_flags = SCTP_EOR;
 	sndinfo.snd_ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
 	if (sctp_sendv(fd,
-	               &iov, 1,
-	               NULL, 0,
-	               &sndinfo, (socklen_t)sizeof(struct sctp_sndinfo),
-	               SCTP_SENDV_SNDINFO, 0) < 0) {
-		perror("sctp_sendv");
-		return (0);
-	} else {
-		return (1);
-	}
-}
-
-static int
-send_open_ack_message(int fd, uint16_t o_stream)
-{
-	/* XXX: This should be encoded in a better way */
-	struct rtcweb_datachannel_ack ack;
-	struct sctp_sndinfo sndinfo;
-	struct iovec iov;
-
-	memset(&ack, 0, sizeof(struct rtcweb_datachannel_ack));
-	ack.msg_type = DATA_CHANNEL_ACK;
-	iov.iov_base = &ack;
-	iov.iov_len = sizeof(struct rtcweb_datachannel_ack);
-	memset(&sndinfo, 0, sizeof(struct sctp_sndinfo));
-	sndinfo.snd_sid = o_stream;
-	sndinfo.snd_flags = SCTP_EOR;
-	sndinfo.snd_ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
-	if (sctp_sendv(fd,
-	               &iov, 1,
+	               iov, 1,
 	               NULL, 0,
 	               &sndinfo, (socklen_t)sizeof(struct sctp_sndinfo),
 	               SCTP_SENDV_SNDINFO, 0) < 0) {
@@ -377,7 +254,7 @@ send_deferred_messages(struct peer_connection *pc)
 	for (i = 0; i < NUMBER_OF_CHANNELS; i++) {
 		channel = &(pc->channels[i]);
 		if (channel->flags & DATA_CHANNEL_FLAGS_SEND_REQ) {
-			if (send_open_request_message(pc->fd, channel->o_stream, channel->unordered, channel->pr_policy, channel->pr_value)) {
+			if (send_data_channel_open_message(pc->fd, channel->sid, channel->type, channel->priority, channel->pr_value, channel->label, channel->protocol)) {
 				channel->flags &= ~DATA_CHANNEL_FLAGS_SEND_REQ;
 			} else {
 				if (errno != EAGAIN) {
@@ -385,17 +262,8 @@ send_deferred_messages(struct peer_connection *pc)
 				}
 			}
 		}
-		if (channel->flags & DATA_CHANNEL_FLAGS_SEND_RSP) {
-			if (send_open_response_message(pc->fd, channel->o_stream, channel->i_stream)) {
-				channel->flags &= ~DATA_CHANNEL_FLAGS_SEND_RSP;
-			} else {
-				if (errno != EAGAIN) {
-					/* XXX: error handling */
-				}
-			}
-		}
 		if (channel->flags & DATA_CHANNEL_FLAGS_SEND_ACK) {
-			if (send_open_ack_message(pc->fd, channel->o_stream)) {
+			if (send_data_channel_ack_message(pc->fd, channel->sid)) {
 				channel->flags &= ~DATA_CHANNEL_FLAGS_SEND_ACK;
 			} else {
 				if (errno != EAGAIN) {
@@ -408,14 +276,18 @@ send_deferred_messages(struct peer_connection *pc)
 }
 
 static struct channel *
-open_channel(struct peer_connection *pc, uint8_t unordered, uint16_t pr_policy, uint32_t pr_value)
+open_channel(struct peer_connection *pc,
+             uint8_t unordered,
+             uint16_t pr_policy, uint32_t pr_value,
+             uint16_t priority,
+             char *label,
+             char *protocol)
 {
 	struct channel *channel;
-	uint16_t o_stream;
 
 	if ((pr_policy != SCTP_PR_SCTP_NONE) &&
-	    (pr_policy != SCTP_PR_SCTP_TTL) &&
-	    (pr_policy != SCTP_PR_SCTP_RTX)) {
+	    (pr_policy != SCTP_PR_SCTP_RTX) &&
+	    (pr_policy != SCTP_PR_SCTP_TTL)) {
 		return (NULL);
 	}
 	if ((unordered != 0) && (unordered != 1)) {
@@ -424,34 +296,55 @@ open_channel(struct peer_connection *pc, uint8_t unordered, uint16_t pr_policy, 
 	if ((pr_policy == SCTP_PR_SCTP_NONE) && (pr_value != 0)) {
 		return (NULL);
 	}
+	if ((label == NULL) || (protocol == NULL)) {
+		return (NULL);
+	}
+	if ((strlen(label) > 65535) || (strlen(protocol) > 65535)) {
+		return (NULL);
+	}
 	if ((channel = find_free_channel(pc)) == NULL) {
 		return (NULL);
 	}
-	o_stream = find_free_o_stream(pc);
-	channel->state = DATA_CHANNEL_CONNECTING;
-	channel->unordered = unordered;
 	channel->pr_policy = pr_policy;
 	channel->pr_value = pr_value;
-	channel->o_stream = o_stream;
+	channel->unordered = unordered;
+	switch (pr_policy) {
+	case SCTP_PR_SCTP_NONE:
+		channel->type = DATA_CHANNEL_RELIABLE;
+		break;
+	case SCTP_PR_SCTP_RTX:
+		channel->type = DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT;
+		break;
+	case SCTP_PR_SCTP_TTL:
+		channel->type = DATA_CHANNEL_PARTIAL_RELIABLE_TIMED;
+		break;
+	}
+	if (unordered) {
+		channel->type |= DATA_CHANNEL_UNORDERED;
+	}
+	channel->priority = priority;
+	channel->label = strdup(label);
+	channel->protocol = strdup(protocol);
+	channel->state = DATA_CHANNEL_CONNECTING;
 	channel->flags = 0;
-	if (o_stream == 0) {
-		request_more_o_streams(pc);
+	if (send_data_channel_open_message(pc->fd, channel->sid, channel->type, channel->priority, channel->pr_value, channel->label, channel->protocol)) {
+		channel->state = DATA_CHANNEL_CONNECTING;
 	} else {
-		if (send_open_request_message(pc->fd, o_stream, unordered, pr_policy, pr_value)) {
-			pc->o_stream_channel[o_stream] = channel;
+		if (errno == EAGAIN) {
+			channel->flags |= DATA_CHANNEL_FLAGS_SEND_REQ;
 		} else {
-			if (errno == EAGAIN) {
-				pc->o_stream_channel[o_stream] = channel;
-				channel->flags |= DATA_CHANNEL_FLAGS_SEND_REQ;
-			} else {
-				channel->state = DATA_CHANNEL_CLOSED;
-				channel->unordered = 0;
-				channel->pr_policy = 0;
-				channel->pr_value = 0;
-				channel->o_stream = 0;
-				channel->flags = 0;
-				channel = NULL;
-			}
+			channel->pr_policy = SCTP_PR_SCTP_NONE;
+			channel->pr_value = 0;
+			channel->unordered = 0;
+			channel->type = 0xff;
+			channel->priority = 0;
+			free(channel->label);
+			channel->label = NULL;
+			free(channel->protocol);
+			channel->protocol = NULL;
+			channel->state = DATA_CHANNEL_CLOSED;
+			channel->flags = 0;
+			channel = NULL;
 		}
 	}
 	return (channel);
@@ -475,7 +368,7 @@ send_user_message(struct peer_connection *pc, struct channel *channel, char *mes
 	iov.iov_base = message;
 	iov.iov_len = length;
 	memset(&spa, 0, sizeof(struct sctp_sendv_spa));
-	spa.sendv_sndinfo.snd_sid = channel->o_stream;
+	spa.sendv_sndinfo.snd_sid = channel->sid;
 	if ((channel->state == DATA_CHANNEL_OPEN) &&
 	    (channel->unordered)) {
 		spa.sendv_sndinfo.snd_flags = SCTP_EOR | SCTP_UNORDERED;
@@ -503,50 +396,25 @@ send_user_message(struct peer_connection *pc, struct channel *channel, char *mes
 }
 
 static void
-reset_outgoing_stream(struct peer_connection *pc, uint16_t o_stream)
-{
-	uint32_t i;
-
-	for (i = 0; i < pc->o_stream_buffer_counter; i++) {
-		if (pc->o_stream_buffer[i] == o_stream) {
-			return;
-		}
-	}
-	pc->o_stream_buffer[pc->o_stream_buffer_counter++] = o_stream;
-	return;
-}
-
-static void
-send_outgoing_stream_reset(struct peer_connection *pc)
+reset_outgoing_stream(struct peer_connection *pc, uint16_t sid)
 {
 	struct sctp_reset_streams *srs;
-	uint32_t i;
 	size_t len;
 
-	if (pc->o_stream_buffer_counter == 0) {
-		return;
-	}
-	len = sizeof(sctp_assoc_t) + (2 + pc->o_stream_buffer_counter) * sizeof(uint16_t);
+	len = sizeof(struct sctp_reset_streams) + sizeof(uint16_t);
 	srs = (struct sctp_reset_streams *)malloc(len);
 	if (srs == NULL) {
 		return;
 	}
 	memset(srs, 0, len);
 	srs->srs_flags = SCTP_STREAM_RESET_OUTGOING;
-	srs->srs_number_streams = pc->o_stream_buffer_counter;
-	for (i = 0; i < pc->o_stream_buffer_counter; i++) {
-		srs->srs_stream_list[i] = pc->o_stream_buffer[i];
-	}
+	srs->srs_number_streams = 1;
+	srs->srs_stream_list[0] = sid;
 	if (setsockopt(pc->fd, IPPROTO_SCTP, SCTP_RESET_STREAMS, srs, (socklen_t)len) < 0) {
 		perror("setsockopt");
-	} else {
-		for (i = 0; i < pc->o_stream_buffer_counter; i++) {
-			srs->srs_stream_list[i] = 0;
-		}
-		pc->o_stream_buffer_counter = 0;
+		printf("reset_outgoing_stream: Can't reset stream %u.\n", sid);
 	}
 	free(srs);
-	return;
 }
 
 static void
@@ -558,139 +426,19 @@ close_channel(struct peer_connection *pc, struct channel *channel)
 	if (channel->state != DATA_CHANNEL_OPEN) {
 		return;
 	}
-	reset_outgoing_stream(pc, channel->o_stream);
-	send_outgoing_stream_reset(pc);
+	reset_outgoing_stream(pc, channel->sid);
 	channel->state = DATA_CHANNEL_CLOSING;
-	return;
-}
-
-static void
-handle_open_request_message(struct peer_connection *pc,
-                            struct rtcweb_datachannel_open_request *req,
-                            size_t length,
-                            uint16_t i_stream)
-{
-	struct channel *channel;
-	uint32_t pr_value;
-	uint16_t pr_policy;
-	uint16_t o_stream;
-	uint8_t unordered;
-
-	if ((channel = find_channel_by_i_stream(pc, i_stream))) {
-		printf("handle_open_request_message: channel %d is in state %d instead of CLOSED.\n",
-		       channel->id, channel->state);
-		/* XXX: some error handling */
-		return;
-	}
-	if ((channel = find_free_channel(pc)) == NULL) {
-		/* XXX: some error handling */
-		return;
-	}
-	switch (req->channel_type) {
-	case DATA_CHANNEL_RELIABLE:
-		pr_policy = SCTP_PR_SCTP_NONE;
-		break;
-	/* XXX Doesn't make sense */
-	case DATA_CHANNEL_RELIABLE_STREAM:
-		pr_policy = SCTP_PR_SCTP_NONE;
-		break;
-	/* XXX Doesn't make sense */
-	case DATA_CHANNEL_UNRELIABLE:
-		pr_policy = SCTP_PR_SCTP_TTL;
-		break;
-	case DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT:
-		pr_policy = SCTP_PR_SCTP_RTX;
-		break;
-	case DATA_CHANNEL_PARTIAL_RELIABLE_TIMED:
-		pr_policy = SCTP_PR_SCTP_TTL;
-		break;
-	default:
-		/* XXX error handling */
-		break;
-	}
-	pr_value = ntohs(req->reliability_params);
-	if (ntohs(req->flags) & DATA_CHANNEL_FLAG_OUT_OF_ORDER_ALLOWED) {
-		unordered = 1;
-	} else {
-		unordered = 0;
-	}
-	o_stream = find_free_o_stream(pc);
-	channel->state = DATA_CHANNEL_CONNECTING;
-	channel->unordered = unordered;
-	channel->pr_policy = pr_policy;
-	channel->pr_value = pr_value;
-	channel->i_stream = i_stream;
-	channel->o_stream = o_stream;
-	channel->flags = 0;
-	pc->i_stream_channel[i_stream] = channel;
-	if (o_stream == 0) {
-		request_more_o_streams(pc);
-	} else {
-		if (send_open_response_message(pc->fd, o_stream, i_stream)) {
-			pc->o_stream_channel[o_stream] = channel;
-		} else {
-			if (errno == EAGAIN) {
-				channel->flags |= DATA_CHANNEL_FLAGS_SEND_RSP;
-				pc->o_stream_channel[o_stream] = channel;
-			} else {
-				/* XXX: Signal error to the other end. */
-				pc->i_stream_channel[i_stream] = NULL;
-				channel->state = DATA_CHANNEL_CLOSED;
-				channel->unordered = 0;
-				channel->pr_policy = 0;
-				channel->pr_value = 0;
-				channel->i_stream = 0;
-				channel->o_stream = 0;
-				channel->flags = 0;
-			}
-		}
-	}
-}
-
-static void
-handle_open_response_message(struct peer_connection *pc,
-                             struct rtcweb_datachannel_open_response *rsp,
-                             size_t length, uint16_t i_stream)
-{
-	uint16_t o_stream;
-	struct channel *channel;
-
-	o_stream = ntohs(rsp->reverse_stream);
-	channel = find_channel_by_o_stream(pc, o_stream);
-	if (channel == NULL) {
-		/* XXX: improve error handling */
-		printf("handle_open_response_message: Can't find channel for outgoing steam %d.\n", o_stream);
-		return;
-	}
-	if (channel->state != DATA_CHANNEL_CONNECTING) {
-		/* XXX: improve error handling */
-		printf("handle_open_response_message: Channel with id %d for outgoing steam %d is in state %d.\n", channel->id, o_stream, channel->state);
-		return;
-	}
-	if (find_channel_by_i_stream(pc, i_stream)) {
-		/* XXX: improve error handling */
-		printf("handle_open_response_message: Channel collision for channel with id %d and streams (in/out) = (%d/%d).\n", channel->id, i_stream, o_stream);
-		return;
-	}
-	channel->i_stream = i_stream;
-	channel->state = DATA_CHANNEL_OPEN;
-	pc->i_stream_channel[i_stream] = channel;
-	if (send_open_ack_message(pc->fd, o_stream)) {
-		channel->flags = 0;
-	} else {
-		channel->flags |= DATA_CHANNEL_FLAGS_SEND_ACK;
-	}
 	return;
 }
 
 static void
 handle_open_ack_message(struct peer_connection *pc,
                         struct rtcweb_datachannel_ack *ack,
-                        size_t length, uint16_t i_stream)
+                        size_t length, uint16_t sid)
 {
 	struct channel *channel;
 
-	channel = find_channel_by_i_stream(pc, i_stream);
+	channel = find_channel_by_id(pc, sid);
 	if (channel == NULL) {
 		/* XXX: some error handling */
 		return;
@@ -707,6 +455,88 @@ handle_open_ack_message(struct peer_connection *pc,
 }
 
 static void
+handle_open_request_message(struct peer_connection *pc,
+                            struct rtcweb_datachannel_open *dc_open,
+                            size_t length,
+                            uint16_t sid)
+{
+	struct channel *channel;
+	uint16_t label_length;
+	uint16_t protocol_length;
+
+	label_length = ntohs(dc_open->label_length);
+	protocol_length = ntohs(dc_open->protocol_length);
+	if (sizeof(struct rtcweb_datachannel_open) + label_length + protocol_length != length) {
+		printf("handle_open_request_message: invalid packet.\n");
+	}
+	if ((channel = find_channel_by_id(pc, sid)) == NULL) {
+		printf("handle_open_request_message: Can't find channel for id = %u.\n",
+		       sid);
+		/* XXX: some error handling */
+		return;
+	}
+	if (channel->state != DATA_CHANNEL_CLOSED) {
+		printf("handle_open_request_message: channel for id = %u not in CLOSED (state = %u).\n",
+		       sid, channel->state);
+		/* XXX: some error handling */
+		return;
+	}
+	channel->type = dc_open->channel_type;
+	switch (dc_open->channel_type) {
+	case DATA_CHANNEL_RELIABLE:
+		channel->pr_policy = SCTP_PR_SCTP_NONE;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 0;
+		break;
+	case DATA_CHANNEL_RELIABLE_UNORDERED:
+		channel->pr_policy = SCTP_PR_SCTP_NONE;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 1;
+		break;
+	case DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT:
+		channel->pr_policy = SCTP_PR_SCTP_RTX;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 0;
+		break;
+	case DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED:
+		channel->pr_policy = SCTP_PR_SCTP_RTX;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 1;
+		break;
+	case DATA_CHANNEL_PARTIAL_RELIABLE_TIMED:
+		channel->pr_policy = SCTP_PR_SCTP_TTL;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 0;
+		break;
+	case DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED:
+		channel->pr_policy = SCTP_PR_SCTP_TTL;
+		channel->pr_value = ntohl(dc_open->reliability_parameter);
+		channel->unordered = 1;
+		break;
+	default:
+		/* XXX error handling */
+		break;
+	}
+	channel->type = dc_open->channel_type;
+	channel->priority = ntohs(dc_open->priority);
+	channel->label = malloc((size_t)label_length + 1);
+	memcpy(channel->label, dc_open->label_and_protocol, label_length);
+	channel->label[label_length] = '\0';
+	channel->protocol = malloc((size_t)protocol_length + 1);
+	memcpy(channel->protocol, dc_open->label_and_protocol + label_length, protocol_length);
+	channel->label[protocol_length] = '\0';
+	channel->state = DATA_CHANNEL_OPEN;
+	channel->flags = 0;
+	if (send_data_channel_ack_message(pc->fd, sid) == 0) {
+		if (errno == EAGAIN) {
+			channel->flags |= DATA_CHANNEL_FLAGS_SEND_ACK;
+		} else {
+			/* XXX error handling*/
+		}
+	}
+}
+
+static void
 handle_unknown_message(char *msg, size_t length, uint16_t i_stream)
 {
 	/* XXX: Send an error message */
@@ -715,11 +545,11 @@ handle_unknown_message(char *msg, size_t length, uint16_t i_stream)
 
 static void
 handle_data_message(struct peer_connection *pc,
-                    char *buffer, size_t length, uint16_t i_stream)
+                    char *buffer, size_t length, uint16_t sid)
 {
 	struct channel *channel;
 
-	channel = find_channel_by_i_stream(pc, i_stream);
+	channel = find_channel_by_id(pc, sid);
 	if (channel == NULL) {
 		/* XXX: Some error handling */
 		return;
@@ -736,61 +566,53 @@ handle_data_message(struct peer_connection *pc,
 		/* Assuming DATA_CHANNEL_PPID_DOMSTRING */
 		/* XXX: Protect for non 0 terminated buffer */
 		printf("Message received of length %lu on channel with id %d: %.*s\n",
-		       length, channel->id, (int)length, buffer);
+		       length, channel->sid, (int)length, buffer);
 	}
 	return;
 }
 
 static void
-handle_message(struct peer_connection *pc, char *buffer, size_t length, uint32_t ppid, uint16_t i_stream)
+handle_message(struct peer_connection *pc, char *buffer, size_t length, uint32_t ppid, uint16_t sid)
 {
-	struct rtcweb_datachannel_open_request *req;
-	struct rtcweb_datachannel_open_response *rsp;
-	struct rtcweb_datachannel_ack *ack, *msg;
+	struct rtcweb_datachannel_open *dc_open;
+	struct rtcweb_datachannel_ack *dc_ack;
+	uint8_t type;
 
 	switch (ppid) {
 	case DATA_CHANNEL_PPID_CONTROL:
-		if (length < sizeof(struct rtcweb_datachannel_ack)) {
+		if (length < sizeof(uint8_t)) {
 			return;
 		}
-		msg = (struct rtcweb_datachannel_ack *)buffer;
-		switch (msg->msg_type) {
-		case DATA_CHANNEL_OPEN_REQUEST:
-			if (length < sizeof(struct rtcweb_datachannel_open_request)) {
-				/* XXX: error handling? */
-				return;
-			}
-			req = (struct rtcweb_datachannel_open_request *)buffer;
-			handle_open_request_message(pc, req, length, i_stream);
-			break;
-		case DATA_CHANNEL_OPEN_RESPONSE:
-			if (length < sizeof(struct rtcweb_datachannel_open_response)) {
-				/* XXX: error handling? */
-				return;
-			}
-			rsp = (struct rtcweb_datachannel_open_response *)buffer;
-			handle_open_response_message(pc, rsp, length, i_stream);
-			break;
-		case DATA_CHANNEL_ACK:
+		type = *(uint8_t *)buffer;
+		switch (type) {
+		case DATA_CHANNEL_ACK_MESSAGE_TYPE:
 			if (length < sizeof(struct rtcweb_datachannel_ack)) {
 				/* XXX: error handling? */
 				return;
 			}
-			ack = (struct rtcweb_datachannel_ack *)buffer;
-			handle_open_ack_message(pc, ack, length, i_stream);
+			dc_ack = (struct rtcweb_datachannel_ack *)buffer;
+			handle_open_ack_message(pc, dc_ack, length, sid);
+			break;
+		case DATA_CHANNEL_OPEN_MESSAGE_TYPE:
+			if (length < sizeof(struct rtcweb_datachannel_open)) {
+				/* XXX: error handling? */
+				return;
+			}
+			dc_open = (struct rtcweb_datachannel_open *)buffer;
+			handle_open_request_message(pc, dc_open, length, sid);
 			break;
 		default:
-			handle_unknown_message(buffer, length, i_stream);
+			handle_unknown_message(buffer, length, sid);
 			break;
 		}
 		break;
 	case DATA_CHANNEL_PPID_DOMSTRING:
 	case DATA_CHANNEL_PPID_BINARY:
-		handle_data_message(pc, buffer, length, i_stream);
+		handle_data_message(pc, buffer, length, sid);
 		break;
 	default:
 		printf("Message of length %lu, PPID %u on stream %u received.\n",
-		       length, ppid, i_stream);
+		       length, ppid, sid);
 		break;
 	}
 }
@@ -952,90 +774,37 @@ handle_stream_reset_event(struct peer_connection *pc, struct sctp_stream_reset_e
 		}
 		printf("%d", strrst->strreset_stream_list[i]);
 	}
-	printf(".\n");	
+	printf(".\n");
 	if (!(strrst->strreset_flags & SCTP_STREAM_RESET_DENIED) &&
 	    !(strrst->strreset_flags & SCTP_STREAM_RESET_FAILED)) {
 		for (i = 0; i < n; i++) {
+			channel = find_channel_by_id(pc, strrst->strreset_stream_list[i]);
+			if (channel == NULL) {
+				printf("handle_stream_reset_event: channel not found for id = %u.\n", strrst->strreset_stream_list[i]);
+				continue;
+			}
 			if (strrst->strreset_flags & SCTP_STREAM_RESET_INCOMING_SSN) {
-				channel = find_channel_by_i_stream(pc, strrst->strreset_stream_list[i]);
-				if (channel != NULL) {
-					pc->i_stream_channel[channel->i_stream] = NULL;
-					channel->i_stream = 0;
-					if (channel->o_stream == 0) {
-						channel->pr_policy = SCTP_PR_SCTP_NONE;
-						channel->pr_value = 0;
-						channel->unordered = 0;
-						channel->flags = 0;
-						channel->state = DATA_CHANNEL_CLOSED;
-					} else {
-						if (channel->state == DATA_CHANNEL_OPEN) {
-							reset_outgoing_stream(pc, channel->o_stream);
-							channel->state = DATA_CHANNEL_CLOSING;
-						} else {
-							/* XXX: error handling? */
-						}
-					}
+				if ((channel->flags & DATA_CHANNEL_FLAGS_O_RESET) == 0) {
+					reset_outgoing_stream(pc, channel->sid);
 				}
+				channel->flags |= DATA_CHANNEL_FLAGS_I_RESET;
 			}
 			if (strrst->strreset_flags & SCTP_STREAM_RESET_OUTGOING_SSN) {
-				channel = find_channel_by_o_stream(pc, strrst->strreset_stream_list[i]);
-				if (channel != NULL) {
-					pc->o_stream_channel[channel->o_stream] = NULL;
-					channel->o_stream = 0;
-					if (channel->i_stream == 0) {
-						channel->pr_policy = SCTP_PR_SCTP_NONE;
-						channel->pr_value = 0;
-						channel->unordered = 0;
-						channel->flags = 0;
-						channel->state = DATA_CHANNEL_CLOSED;
-					}
-				}
+				channel->flags |= DATA_CHANNEL_FLAGS_O_RESET;
 			}
-		}
-	}
-	return;
-}
-
-static void
-handle_stream_change_event(struct peer_connection *pc, struct sctp_stream_change_event *strchg)
-{
-	uint16_t o_stream;
-	uint32_t i;
-	struct channel *channel;
-
-	printf("Stream change event: streams (in/out) = (%u/%u), flags = %x.\n",
-	       strchg->strchange_instrms, strchg->strchange_outstrms, strchg->strchange_flags);
-	for (i = 0; i < NUMBER_OF_CHANNELS; i++) {
-		channel = &(pc->channels[i]);
-		if ((channel->state == DATA_CHANNEL_CONNECTING) &&
-		    (channel->o_stream == 0)) {
-			if ((strchg->strchange_flags & SCTP_STREAM_CHANGE_DENIED) ||
-			    (strchg->strchange_flags & SCTP_STREAM_CHANGE_FAILED)) {
-				/* XXX: Signal to the other end. */
-				if (channel->i_stream != 0) {
-					pc->i_stream_channel[channel->i_stream] = NULL;
-				}
-				channel->unordered = 0;
+			if ((channel->flags & DATA_CHANNEL_FLAGS_I_RESET) &&
+			    (channel->flags & DATA_CHANNEL_FLAGS_I_RESET)) {
 				channel->pr_policy = SCTP_PR_SCTP_NONE;
 				channel->pr_value = 0;
-				channel->i_stream = 0;
-				channel->o_stream = 0;
-				channel->flags = 0;
+				channel->unordered = 0;
+				channel->type = 0xff;
+				channel->priority = 0;
+				free(channel->label);
+				channel->label = NULL;
+				free(channel->protocol);
+				channel->protocol = NULL;
 				channel->state = DATA_CHANNEL_CLOSED;
-			} else {
-				o_stream = find_free_o_stream(pc);
-				if (o_stream != 0) {
-					channel->o_stream = o_stream;
-					pc->o_stream_channel[o_stream] = channel;
-					if (channel->i_stream == 0) {
-						channel->flags |= DATA_CHANNEL_FLAGS_SEND_REQ;
-					} else {
-						channel->flags |= DATA_CHANNEL_FLAGS_SEND_RSP;
-					}
-				} else {
-					/* We will not find more ... */
-					break;
-				}
+				channel->flags = 0;
 			}
 		}
 	}
@@ -1117,16 +886,10 @@ handle_notification(struct peer_connection *pc, union sctp_notification *notif, 
 	case SCTP_STREAM_RESET_EVENT:
 		handle_stream_reset_event(pc, &(notif->sn_strreset_event));
 		send_deferred_messages(pc);
-		send_outgoing_stream_reset(pc);
-		request_more_o_streams(pc);
 		break;
 	case SCTP_ASSOC_RESET_EVENT:
 		break;
 	case SCTP_STREAM_CHANGE_EVENT:
-		handle_stream_change_event(pc, &(notif->sn_strchange_event));
-		send_deferred_messages(pc);
-		send_outgoing_stream_reset(pc);
-		request_more_o_streams(pc);
 		break;
 	default:
 		break;
@@ -1189,7 +952,7 @@ print_status(struct peer_connection *pc)
 		if (channel->state == DATA_CHANNEL_CLOSED) {
 			continue;
 		}
-		printf("Channel with id = %u: state ", channel->id);
+		printf("Channel with id = %u: state ", channel->sid);
 		switch (channel->state) {
 		case DATA_CHANNEL_CLOSED:
 			printf("CLOSED");
@@ -1207,15 +970,38 @@ print_status(struct peer_connection *pc)
 			printf("UNKNOWN(%d)", channel->state);
 			break;
 		}
-		printf(", flags = 0x%08x, stream id (in/out): (%u/%u), ",
-		       channel->flags,
-		       channel->i_stream,
-		       channel->o_stream);
+		printf(", ");
+		printf("type ");
+		switch (channel->type) {
+		case DATA_CHANNEL_RELIABLE:
+			printf("DATA_CHANNEL_RELIABLE");
+			break;
+		case DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT:
+			printf("DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT");
+			break;
+		case DATA_CHANNEL_PARTIAL_RELIABLE_TIMED:
+			printf("DATA_CHANNEL_PARTIAL_RELIABLE_TIMED");
+			break;
+		case DATA_CHANNEL_RELIABLE_UNORDERED:
+			printf("DATA_CHANNEL_RELIABLE_UNORDERED");
+			break;
+		case DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED:
+			printf("DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED");
+			break;
+		case DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED:
+			printf("DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED");
+			break;
+		default:
+			printf("%u.\n", channel->type);
+			break;
+		}
+		printf(", ");
 		if (channel->unordered) {
 			printf("unordered, ");
 		} else {
 			printf("ordered, ");
 		}
+		printf("priority %u, ", channel->priority);
 		switch (channel->pr_policy) {
 		case SCTP_PR_SCTP_NONE:
 			printf("reliable.\n");
@@ -1280,7 +1066,7 @@ main(int argc, char *argv[])
 	struct sockaddr_in addr;
 	socklen_t addr_len;
 	char line[LINE_LENGTH + 1];
-	unsigned int unordered, policy, value, id, seconds;
+	unsigned int unordered, policy, value, priority, id, seconds;
 	unsigned int i;
 	struct channel *channel;
 	const int on = 1;
@@ -1288,6 +1074,7 @@ main(int argc, char *argv[])
 	struct sctp_event event;
 	pthread_t tid;
 	struct sctp_initmsg initmsg;
+	int client;
 	uint16_t event_types[] = {SCTP_ASSOC_CHANGE,
 	                          SCTP_PEER_ADDR_CHANGE,
 	                          SCTP_REMOTE_ERROR,
@@ -1367,6 +1154,7 @@ main(int argc, char *argv[])
 	}
 
 	if (argc > 2) {
+		client = 1;
 		/* operating as client */
 		memset(&addr, 0, sizeof(struct sockaddr_in));
 		addr.sin_family = AF_INET;
@@ -1384,6 +1172,7 @@ main(int argc, char *argv[])
 		int afd;
 
 		/* operating as server */
+		client = 0;
 		memset(&addr, 0, sizeof(struct sockaddr_in));
 		addr.sin_family = AF_INET;
 #ifdef HAVE_SIN_LEN
@@ -1415,7 +1204,7 @@ main(int argc, char *argv[])
 		return (0);
 	}
 
-	init_peer_connection(&peer_connection, fd);
+	init_peer_connection(&peer_connection, fd, client);
 	pthread_create(&tid, NULL, &handle_messages, &peer_connection);
 
 	for (;;) {
@@ -1426,7 +1215,7 @@ main(int argc, char *argv[])
 		if (strncmp(line, "?", strlen("?")) == 0 ||
 		    strncmp(line, "help", strlen("help")) == 0) {
 			printf("Commands:\n"
-			       "open unordered pr_policy pr_value - opens a channel\n"
+			       "open unordered pr_policy pr_value priority - opens a channel\n"
 			       "close channel - closes the channel\n"
 			       "send channel:string - sends string using channel\n"
 			       "status - prints the status\n"
@@ -1436,14 +1225,14 @@ main(int argc, char *argv[])
 			lock_peer_connection(&peer_connection);
 			print_status(&peer_connection);
 			unlock_peer_connection(&peer_connection);
-		} else if (sscanf(line, "open %u %u %u", &unordered, &policy, &value) == 3) {
+		} else if (sscanf(line, "open %u %u %u %u", &unordered, &policy, &value, &priority) == 4) {
 			lock_peer_connection(&peer_connection);
-			channel = open_channel(&peer_connection, (uint8_t)unordered, (uint16_t)policy, (uint32_t)value);
+			channel = open_channel(&peer_connection, (uint8_t)unordered, (uint16_t)policy, (uint32_t)value, priority, "", "");
 			unlock_peer_connection(&peer_connection);
 			if (channel == NULL) {
 				printf("Creating channel failed.\n");
 			} else {
-				printf("Channel with id %u created.\n", channel->id);
+				printf("Channel with id %u created.\n", channel->sid);
 			}
 		} else if (sscanf(line, "close %u", &id) == 1) {
 			if (id < NUMBER_OF_CHANNELS) {

@@ -1156,6 +1156,18 @@ main(int argc, char *argv[])
 	if (argc > 2) {
 		client = 1;
 		/* operating as client */
+		if (argc > 3) {
+			memset(&addr, 0, sizeof(struct sockaddr_in));
+			addr.sin_family = AF_INET;
+#ifdef HAVE_SIN_LEN
+			addr.sin_len = sizeof(struct sockaddr_in);
+#endif
+			addr.sin_addr.s_addr = INADDR_ANY;
+			addr.sin_port = htons(atoi(argv[3]));
+			if (bind(fd, (const struct sockaddr *)&addr, sizeof(struct sockaddr_in)) < 0) {
+				perror("bind");
+			}
+		}
 		memset(&addr, 0, sizeof(struct sockaddr_in));
 		addr.sin_family = AF_INET;
 #ifdef HAVE_SIN_LEN
@@ -1199,7 +1211,7 @@ main(int argc, char *argv[])
 		       inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 	} else {
 		printf("Usage: %s local_port when operating as server\n"
-		       "       %s remote_addr remote_port when operating as client\n",
+		       "       %s remote_addr remote_port [local_port] when operating as client\n",
 		       argv[0], argv[0]);
 		return (0);
 	}

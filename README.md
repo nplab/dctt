@@ -34,7 +34,7 @@ The server will bind to all available IPv4 addresses and `local_port`.
 
 For using it as a client issue
 ```
-./dctt remote_addr remote_port
+./dctt remote_addr remote_port [local_port]
 ```
-The client will bind to all local addresses and an ephemeral port and initiate an
+The client will bind to all local addresses and an ephemeral port or `local_port` if set and initiate an
 SCTP association towards the IPv4 address `remote_addr` and the port `remote_port`.

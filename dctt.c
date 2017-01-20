@@ -793,7 +793,7 @@ handle_stream_reset_event(struct peer_connection *pc, struct sctp_stream_reset_e
 				channel->flags |= DATA_CHANNEL_FLAGS_O_RESET;
 			}
 			if ((channel->flags & DATA_CHANNEL_FLAGS_I_RESET) &&
-			    (channel->flags & DATA_CHANNEL_FLAGS_I_RESET)) {
+			    (channel->flags & DATA_CHANNEL_FLAGS_O_RESET)) {
 				channel->pr_policy = SCTP_PR_SCTP_NONE;
 				channel->pr_value = 0;
 				channel->unordered = 0;
